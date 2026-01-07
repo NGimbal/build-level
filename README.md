@@ -107,7 +107,6 @@ Detailed documentation for each module:
 - [11 - Comparison Table](./docs/11-comparison-table.md)
 - [12 - Estimate Table](./docs/12-estimate-table.md)
 - [13 - Deployment](./docs/13-deployment.md)
-- [14 - BAML Integration](./docs/14-baml-integration.md)
 
 ## API Reference
 
