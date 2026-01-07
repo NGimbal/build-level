@@ -2,7 +2,7 @@
 
 ## Overview
 
-LLM-based classification service that assigns cost codes to extracted line items. Uses Workers AI to match line item descriptions to the standardized cost code format.
+LLM-based classification service that assigns cost codes to extracted line items. Uses [BAML](https://github.com/BoundaryML/baml) for type-safe batch classification with Workers AI (Llama 3.1).
 
 ## Goals
 
@@ -15,10 +15,142 @@ LLM-based classification service that assigns cost codes to extracted line items
 ## File Structure
 
 ```
-packages/backend/src/services/
-├── classifier.ts           # Main classification service
-└── prompts/
-    └── classification.ts   # Classification prompt templates
+build-level/
+├── baml_src/
+│   ├── clients.baml             # Shared with extraction (Module 05)
+│   ├── types.baml               # Shared types + classification types
+│   ├── classification.baml      # Classification functions
+│   └── tests/
+│       └── classification_tests.baml
+├── baml_client/                 # Generated TypeScript
+└── packages/backend/src/services/
+    └── classifier.ts            # Classifier service using BAML
+```
+
+## Type Definitions (baml_src/types.baml)
+
+Add to existing types.baml from Module 05:
+
+```baml
+// Classification input - line item to classify
+class ClassificationInput {
+  id string @description("Line item ID")
+  description string @description("Line item description text")
+  sectionHeader string? @description("Section header if available")
+  unit string? @description("Unit of measure if available")
+}
+
+// Classification result
+class ClassificationResult {
+  id string @description("Line item ID from input")
+  code string @description("Best matching cost code (e.g., '03_L', '12_M')")
+  confidence float @description("Confidence score 0.0-1.0")
+  alternates AlternateCode[] @description("1-2 alternative codes if uncertain")
+}
+
+class AlternateCode {
+  code string
+  confidence float
+}
+```
+
+## Classification Function (baml_src/classification.baml)
+
+```baml
+function ClassifyLineItems(
+  items: ClassificationInput[],
+  costCodeReference: string
+) -> ClassificationResult[] {
+  client CloudflareLlama
+
+  prompt #"
+    You are a construction cost classification expert. Assign cost codes to these line items.
+
+    AVAILABLE COST CODES:
+    {{ costCodeReference }}
+
+    LINE ITEMS TO CLASSIFY:
+    {% for item in items %}
+    [{{ item.id }}] {{ item.description }}{% if item.sectionHeader %} [Section: {{ item.sectionHeader }}]{% endif %}{% if item.unit %} [Unit: {{ item.unit }}]{% endif %}
+    {% endfor %}
+
+    CLASSIFICATION RULES:
+
+    1. CODE SELECTION
+       - Use the MOST SPECIFIC code that applies (level 2 over level 1)
+       - Section header is strong context for division selection
+       - When uncertain, use the parent division code
+
+    2. COST TYPE CLASSIFICATION (Level 2)
+       - Labor codes (_L): Installation labor, crew hours, worker costs
+       - Material codes (_M): Products, supplies, equipment purchases
+       - Subcontract codes (_S): Third-party work, specialty contractors
+
+    3. CONFIDENCE LEVELS
+       - 0.90-1.00: Exact match, clear category
+       - 0.70-0.89: Good match, minor ambiguity
+       - 0.50-0.69: Reasonable match, some uncertainty
+       - Below 0.50: Uncertain, use broader category
+
+    4. CONTEXT CLUES
+       - Units like "HR" suggest labor (_L)
+       - "Subcontract" or "Sub" in description → _S codes
+       - Material names (lumber, pipe, wire) → _M codes
+       - "Install" or "labor" → _L codes
+
+    5. ALTERNATES
+       - Provide 1-2 alternate codes when classification is uncertain
+
+    DIVISION MAPPINGS:
+    00: Demolition (tear out, remove, demo, abatement)
+    01: Sitework (grading, excavation, landscaping)
+    02: Foundation (footing, slab, concrete foundation)
+    03: Framing (studs, joists, rafters, trusses)
+    04: Roofing (shingles, flashing, gutters)
+    05: Windows & Doors
+    06: Siding & Trim (siding, stucco, exterior trim)
+    07: Electrical (wiring, panel, outlets, lighting)
+    08: HVAC (furnace, AC, ductwork)
+    09: Plumbing (pipes, fixtures, water heater)
+    10: Insulation
+    11: Carpentry (finish carpentry, trim, molding)
+    12: Casework (cabinets, countertops)
+    13: Drywall & Finishes (drywall, paint, tile, flooring)
+    14: Specialties (appliances, fireplace)
+    15: General Conditions (supervision, permits, cleanup)
+
+    {{ ctx.output_format }}
+  "#
+}
+
+// Single item classification for reclassification UI
+function ClassifySingleItem(
+  description: string,
+  sectionHeader: string?,
+  costCodeReference: string
+) -> ClassificationResult {
+  client CloudflareLlama
+
+  prompt #"
+    Classify this construction line item to a cost code.
+
+    AVAILABLE CODES:
+    {{ costCodeReference }}
+
+    LINE ITEM: {{ description }}
+    {% if sectionHeader %}SECTION: {{ sectionHeader }}{% endif %}
+
+    Select the best matching code with confidence score and up to 2 alternates.
+
+    Use these confidence levels:
+    - 0.90-1.00: Exact match
+    - 0.70-0.89: Good match
+    - 0.50-0.69: Reasonable match
+    - Below 0.50: Uncertain
+
+    {{ ctx.output_format }}
+  "#
+}
 ```
 
 ## Core Implementation
@@ -26,29 +158,12 @@ packages/backend/src/services/
 ### Classifier Service (classifier.ts)
 
 ```typescript
-import type { Ai } from '@cloudflare/workers-types';
+import { b } from '../../baml_client';
+import type { ClassificationResult, ClassificationInput } from '../../baml_client/types';
 import type { CostCode } from '@estimate-compare/shared';
 
-export interface ClassificationInput {
-  id: string;
-  description: string;
-  sectionHeader: string | null;
-  quantity?: number | null;
-  unit?: string | null;
-}
-
-export interface ClassificationResult {
-  lineItemId: string;
-  code: string;
-  confidence: number;
-  alternates: Array<{ code: string; confidence: number }>;
-}
-
 export class Classifier {
-  private readonly model = '@cf/meta/llama-3.1-8b-instruct';
   private readonly batchSize = 15;  // Items per LLM call
-  
-  constructor(private ai: Ai) {}
 
   /**
    * Classify multiple line items to cost codes
@@ -58,46 +173,89 @@ export class Classifier {
     costCodes: CostCode[]
   ): Promise<Map<string, ClassificationResult>> {
     const results = new Map<string, ClassificationResult>();
-    
+
     if (items.length === 0) {
       return results;
     }
-    
-    // Build code reference once
+
     const codeReference = this.buildCodeReference(costCodes);
-    
+    const validCodes = new Set(costCodes.map(c => c.code));
+
     // Process in batches
     for (let i = 0; i < items.length; i += this.batchSize) {
       const batch = items.slice(i, i + this.batchSize);
-      
+
       try {
-        const batchResults = await this.classifyBatch(batch, codeReference, costCodes);
-        
+        // BAML handles JSON parsing and validation
+        const batchResults = await b.ClassifyLineItems(batch, codeReference);
+
         for (const result of batchResults) {
-          results.set(result.lineItemId, result);
+          // Validate code exists
+          if (validCodes.has(result.code)) {
+            results.set(result.id, result);
+          } else {
+            // Invalid code returned - use fallback
+            const item = batch.find(item => item.id === result.id);
+            if (item) {
+              results.set(result.id, this.createDefaultClassification(item, costCodes));
+            }
+          }
+        }
+
+        // Handle any missing items in response
+        for (const item of batch) {
+          if (!results.has(item.id)) {
+            results.set(item.id, this.createDefaultClassification(item, costCodes));
+          }
         }
       } catch (error) {
         console.error(`Batch classification failed for items ${i}-${i + batch.length}:`, error);
-        
+
         // Fall back to default classification for failed batch
         for (const item of batch) {
           results.set(item.id, this.createDefaultClassification(item, costCodes));
         }
       }
     }
-    
+
     return results;
   }
 
   /**
-   * Classify a single line item
+   * Classify a single line item (for reclassification UI)
    */
   async classifySingle(
-    item: ClassificationInput,
+    description: string,
+    sectionHeader: string | null,
     costCodes: CostCode[]
   ): Promise<ClassificationResult> {
-    const results = await this.classifyLineItems([item], costCodes);
-    return results.get(item.id) || this.createDefaultClassification(item, costCodes);
+    const codeReference = this.buildCodeReference(costCodes);
+
+    try {
+      const result = await b.ClassifySingleItem(
+        description,
+        sectionHeader,
+        codeReference
+      );
+
+      // Validate code exists
+      const validCodes = new Set(costCodes.map(c => c.code));
+      if (validCodes.has(result.code)) {
+        return result;
+      }
+
+      // Invalid code - return with fallback
+      return this.createDefaultClassification(
+        { id: 'single', description, sectionHeader },
+        costCodes
+      );
+    } catch (error) {
+      console.error('Single classification failed:', error);
+      return this.createDefaultClassification(
+        { id: 'single', description, sectionHeader },
+        costCodes
+      );
+    }
   }
 
   /**
@@ -106,161 +264,20 @@ export class Classifier {
   private buildCodeReference(costCodes: CostCode[]): string {
     const level1Codes = costCodes.filter(c => c.level === 1);
     const lines: string[] = [];
-    
+
     for (const l1 of level1Codes.sort((a, b) => a.sortOrder - b.sortOrder)) {
       lines.push(`${l1.code}: ${l1.label}`);
-      
+
       const children = costCodes
         .filter(c => c.parentCode === l1.code)
         .sort((a, b) => a.sortOrder - b.sortOrder);
-      
+
       for (const child of children) {
-        lines.push(`  ${child.code}: ${child.label} (${l1.label})`);
+        lines.push(`  ${child.code}: ${child.label}`);
       }
     }
-    
+
     return lines.join('\n');
-  }
-
-  /**
-   * Classify a batch of items
-   */
-  private async classifyBatch(
-    items: ClassificationInput[],
-    codeReference: string,
-    costCodes: CostCode[]
-  ): Promise<ClassificationResult[]> {
-    const prompt = this.buildClassificationPrompt(items, codeReference);
-    
-    const response = await this.ai.run(this.model, {
-      messages: [
-        { role: 'system', content: CLASSIFICATION_SYSTEM_PROMPT },
-        { role: 'user', content: prompt },
-      ],
-      max_tokens: 2000,
-      temperature: 0.1,
-    });
-
-    const responseText = typeof response === 'string'
-      ? response
-      : (response as any).response;
-
-    return this.parseClassifications(responseText, items, costCodes);
-  }
-
-  /**
-   * Build prompt for batch classification
-   */
-  private buildClassificationPrompt(
-    items: ClassificationInput[],
-    codeReference: string
-  ): string {
-    const itemsList = items.map(item => {
-      let line = `[${item.id}] ${item.description}`;
-      
-      if (item.sectionHeader) {
-        line += ` [Section: ${item.sectionHeader}]`;
-      }
-      
-      if (item.unit) {
-        line += ` [Unit: ${item.unit}]`;
-      }
-      
-      return line;
-    }).join('\n');
-
-    return `Classify these construction line items to cost codes.
-
-AVAILABLE CODES:
-${codeReference}
-
-LINE ITEMS:
-${itemsList}
-
-Return ONLY a JSON array. No other text.`;
-  }
-
-  /**
-   * Parse classification response
-   */
-  private parseClassifications(
-    responseText: string,
-    items: ClassificationInput[],
-    costCodes: CostCode[]
-  ): ClassificationResult[] {
-    // Extract JSON array
-    let jsonStr = responseText;
-    
-    const codeBlockMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (codeBlockMatch) {
-      jsonStr = codeBlockMatch[1];
-    }
-    
-    const arrayMatch = jsonStr.match(/\[[\s\S]*\]/);
-    if (arrayMatch) {
-      jsonStr = arrayMatch[0];
-    }
-
-    const validCodes = new Set(costCodes.map(c => c.code));
-    
-    try {
-      const parsed = JSON.parse(jsonStr);
-      
-      if (!Array.isArray(parsed)) {
-        throw new Error('Response is not an array');
-      }
-      
-      // Map parsed results to items
-      return items.map(item => {
-        const match = parsed.find((p: any) => p.id === item.id);
-        
-        if (match && validCodes.has(match.code)) {
-          // Validate alternates
-          const alternates = Array.isArray(match.alternates)
-            ? match.alternates
-                .filter((a: any) => validCodes.has(a.code))
-                .slice(0, 3)
-                .map((a: any) => ({
-                  code: a.code,
-                  confidence: this.normalizeConfidence(a.confidence),
-                }))
-            : [];
-          
-          return {
-            lineItemId: item.id,
-            code: match.code,
-            confidence: this.normalizeConfidence(match.confidence),
-            alternates,
-          };
-        }
-        
-        // Item not in response or invalid code
-        return this.createDefaultClassification(item, costCodes);
-      });
-      
-    } catch (error) {
-      console.error('Failed to parse classification response:', error);
-      console.error('Response was:', responseText.slice(0, 500));
-      
-      // Return default classifications for all items
-      return items.map(item => this.createDefaultClassification(item, costCodes));
-    }
-  }
-
-  /**
-   * Normalize confidence to 0-1 range
-   */
-  private normalizeConfidence(value: unknown): number {
-    if (typeof value !== 'number' || isNaN(value)) {
-      return 0.5;
-    }
-    
-    // Handle if provided as percentage
-    if (value > 1) {
-      value = value / 100;
-    }
-    
-    return Math.max(0, Math.min(1, value));
   }
 
   /**
@@ -272,9 +289,9 @@ Return ONLY a JSON array. No other text.`;
   ): ClassificationResult {
     // Try to infer from section header
     const inferredCode = this.inferFromSection(item.sectionHeader, costCodes);
-    
+
     return {
-      lineItemId: item.id,
+      id: item.id,
       code: inferredCode || '15',  // Default to General Conditions
       confidence: inferredCode ? 0.4 : 0.2,
       alternates: [],
@@ -289,19 +306,19 @@ Return ONLY a JSON array. No other text.`;
     costCodes: CostCode[]
   ): string | null {
     if (!section) return null;
-    
+
     const sectionLower = section.toLowerCase();
     const level1Codes = costCodes.filter(c => c.level === 1);
-    
+
     for (const code of level1Codes) {
       const labelLower = code.label.toLowerCase();
       const keywords = code.keywords || [];
-      
+
       // Check label match
       if (sectionLower.includes(labelLower) || labelLower.includes(sectionLower)) {
         return code.code;
       }
-      
+
       // Check keywords
       for (const keyword of keywords) {
         if (sectionLower.includes(keyword.toLowerCase())) {
@@ -309,83 +326,13 @@ Return ONLY a JSON array. No other text.`;
         }
       }
     }
-    
+
     return null;
   }
 }
 ```
 
-### Classification Prompt (prompts/classification.ts)
-
-```typescript
-export const CLASSIFICATION_SYSTEM_PROMPT = `You are a construction cost classification expert. Your task is to assign cost codes to construction line items.
-
-Return ONLY a JSON array with this structure (no other text):
-[
-  {
-    "id": "item-id-from-input",
-    "code": "best-matching-code",
-    "confidence": 0.0-1.0,
-    "alternates": [
-      {"code": "second-choice", "confidence": 0.0-1.0}
-    ]
-  }
-]
-
-CLASSIFICATION RULES:
-
-1. CODE SELECTION
-   - Use the MOST SPECIFIC code that applies (level 2 over level 1)
-   - Consider the section header as strong context
-   - When in doubt, use the parent division code
-
-2. COST TYPE CLASSIFICATION (Level 2)
-   - Labor codes (_L): Installation labor, crew hours, worker costs
-   - Material codes (_M): Products, supplies, equipment purchases
-   - Subcontract codes (_S): Third-party work, specialty contractors
-
-3. CONFIDENCE LEVELS
-   - 0.90-1.00: Exact match, clear category
-   - 0.70-0.89: Good match, minor ambiguity
-   - 0.50-0.69: Reasonable match, some uncertainty
-   - Below 0.50: Uncertain, use broader category
-
-4. CONTEXT CLUES
-   - Section header strongly suggests the division
-   - Units like "HR" suggest labor
-   - "Subcontract" or "Sub" in description → _S codes
-   - Material names (lumber, pipe, wire) → _M codes
-   - "Install" or "labor" → _L codes
-
-5. ALTERNATES
-   - Provide 1-2 alternate codes when classification is uncertain
-   - Alternates should be plausible alternatives
-
-COMMON MAPPINGS:
-
-Division 00 (Demolition): tear out, remove, demo, abatement, gut, strip
-Division 01 (Sitework): grading, excavation, landscaping, dirt, paving
-Division 02 (Foundation): footing, slab, concrete foundation, stem wall
-Division 03 (Framing): studs, joists, rafters, trusses, sheathing, deck framing
-Division 04 (Roofing): shingles, roofing, flashing, gutters, soffit, fascia
-Division 05 (Windows & Doors): windows, doors, entry, sliding door, hardware
-Division 06 (Siding & Trim): siding, exterior trim, stucco, brick veneer
-Division 07 (Electrical): wiring, panel, outlets, switches, lighting, fixtures
-Division 08 (HVAC): furnace, AC, ductwork, ventilation, heat pump
-Division 09 (Plumbing): pipes, fixtures, water heater, drains, faucets
-Division 10 (Insulation): insulation, batt, blown-in, spray foam
-Division 11 (Carpentry): finish carpentry, trim, molding, stairs, railings
-Division 12 (Casework): cabinets, countertops, vanities
-Division 13 (Drywall & Finishes): drywall, paint, tile, flooring
-Division 14 (Specialties): appliances, fireplace, mirrors, accessories
-Division 15 (General Conditions): supervision, permits, cleanup, temporary
-
-Remember: Return ONLY the JSON array.`;
-```
-
-## Advanced Classification
-
-### Confidence-Based Reclassification
+## Quality Metrics
 
 ```typescript
 /**
@@ -414,7 +361,7 @@ export function calculateClassificationMetrics(
 } {
   const values = Array.from(results.values());
   const total = values.length;
-  
+
   if (total === 0) {
     return {
       totalItems: 0,
@@ -424,12 +371,12 @@ export function calculateClassificationMetrics(
       averageConfidence: 0,
     };
   }
-  
+
   const high = values.filter(v => v.confidence >= 0.8).length;
   const medium = values.filter(v => v.confidence >= 0.5 && v.confidence < 0.8).length;
   const low = values.filter(v => v.confidence < 0.5).length;
   const avgConf = values.reduce((sum, v) => sum + v.confidence, 0) / total;
-  
+
   return {
     totalItems: total,
     highConfidence: high,
@@ -440,35 +387,67 @@ export function calculateClassificationMetrics(
 }
 ```
 
-### Batch Reclassification
+## Test Cases (baml_src/tests/classification_tests.baml)
 
-```typescript
-/**
- * Reclassify items that were assigned to a specific code
- */
-export async function reclassifyItemsWithCode(
-  classifier: Classifier,
-  items: ClassificationInput[],
-  oldCode: string,
-  newCode: string,
-  costCodes: CostCode[]
-): Promise<Map<string, ClassificationResult>> {
-  const itemsToReclassify = items.filter(item => {
-    // This would need the current classifications
-    return true;  // Placeholder
-  });
-  
-  // Re-run classification for affected items
-  return classifier.classifyLineItems(itemsToReclassify, costCodes);
+```baml
+test MixedLineItems {
+  functions [ClassifyLineItems]
+  args {
+    items [
+      {id: "item-1", description: "Install kitchen base cabinets", sectionHeader: "CASEWORK", unit: null},
+      {id: "item-2", description: "2x4 studs", sectionHeader: "FRAMING", unit: "BF"},
+      {id: "item-3", description: "Electrical subcontract - rough and finish", sectionHeader: null, unit: null},
+      {id: "item-4", description: "Labor for drywall hanging", sectionHeader: "DRYWALL", unit: "HR"},
+      {id: "item-5", description: "Cleanup and debris removal", sectionHeader: null, unit: null}
+    ]
+    costCodeReference #"
+      00: Demolition
+        00_L: Labor
+        00_M: Material
+        00_S: Subcontracts
+      03: Framing
+        03_L: Labor
+        03_M: Material
+        03_S: Subcontracts
+      07: Electrical
+        07_L: Labor
+        07_M: Material
+        07_S: Subcontracts
+      12: Casework
+        12_L: Labor
+        12_M: Material
+        12_S: Subcontracts
+      13: Drywall & Finishes
+        13_L: Labor
+        13_M: Material
+        13_S: Subcontracts
+      15: General Conditions
+        15_L: Labor
+        15_M: Material
+        15_S: Subcontracts
+    "#
+  }
+}
+
+test SingleItemClassification {
+  functions [ClassifySingleItem]
+  args {
+    description "Install recessed lighting fixtures"
+    sectionHeader "ELECTRICAL"
+    costCodeReference #"
+      07: Electrical
+        07_L: Labor
+        07_M: Material
+        07_S: Subcontracts
+    "#
+  }
 }
 ```
 
 ## Usage in Processing Pipeline
 
 ```typescript
-// In session processing
-
-import { Classifier } from '../services/classifier';
+import { Classifier, calculateClassificationMetrics } from '../services/classifier';
 import { getCostCodesByFormat } from '../db/queries';
 
 async function classifyEstimateItems(
@@ -479,65 +458,49 @@ async function classifyEstimateItems(
   // Get session to find format
   const estimate = await getEstimate(env.DB, estimateId);
   const session = await getSession(env.DB, estimate.sessionId);
-  
+
   // Load cost codes
   const costCodes = await getCostCodesByFormat(env.DB, session.formatId);
-  
+
   // Classify
-  const classifier = new Classifier(env.AI);
+  const classifier = new Classifier();
   const classifications = await classifier.classifyLineItems(
     lineItems.map(item => ({
       id: item.id,
       description: item.description,
       sectionHeader: item.sectionHeader,
+      unit: null,
     })),
     costCodes
   );
-  
+
   // Log metrics
   const metrics = calculateClassificationMetrics(classifications);
   console.log('Classification metrics:', metrics);
-  
+
   return classifications;
 }
 ```
 
 ## Todo List
 
-### Core Classifier
+### BAML Functions
 
-- [ ] Create classifier.ts file
-- [ ] Implement Classifier class
-- [ ] Implement classifyLineItems method (batch)
-- [ ] Implement classifySingle method
+- [ ] Add classification types to `types.baml`
+- [ ] Create `classification.baml` with ClassifyLineItems function
+- [ ] Create ClassifySingleItem function for reclassification UI
+- [ ] Run `baml generate` to update TypeScript client
+
+### Classifier Service
+
+- [ ] Create classifier.ts using BAML client
+- [ ] Implement classifyLineItems with batch processing
+- [ ] Implement classifySingle for reclassification
 - [ ] Implement buildCodeReference method
-- [ ] Implement classifyBatch method
-- [ ] Implement buildClassificationPrompt method
+- [ ] Implement createDefaultClassification fallback
+- [ ] Implement inferFromSection helper
 
-### Response Parsing
-
-- [ ] Implement parseClassifications method
-- [ ] Handle JSON extraction from markdown
-- [ ] Validate codes against valid code list
-- [ ] Normalize confidence values
-- [ ] Handle missing/invalid items in response
-
-### Fallback Logic
-
-- [ ] Implement createDefaultClassification method
-- [ ] Implement inferFromSection method
-- [ ] Test fallback with various section headers
-- [ ] Handle batch failures gracefully
-
-### Prompts
-
-- [ ] Create prompts/classification.ts file
-- [ ] Write CLASSIFICATION_SYSTEM_PROMPT
-- [ ] Include all division mappings
-- [ ] Test prompt with various line items
-- [ ] Refine prompt based on results
-
-### Utilities
+### Quality Utilities
 
 - [ ] Implement getLowConfidenceItems function
 - [ ] Implement calculateClassificationMetrics function
@@ -545,6 +508,7 @@ async function classifyEstimateItems(
 
 ### Testing
 
+- [ ] Create test cases in `baml_src/tests/`
 - [ ] Test with clear division assignments
 - [ ] Test with ambiguous items
 - [ ] Test cost type classification (L/M/S)
@@ -552,7 +516,6 @@ async function classifyEstimateItems(
 - [ ] Test single item classification
 - [ ] Test fallback behavior
 - [ ] Verify confidence scores are reasonable
-- [ ] Test with real estimate line items
 
 ## Verification Checklist
 
@@ -590,8 +553,8 @@ Expected accuracy by category:
 
 1. **Section Headers**: Strong signal - ensure parsed correctly
 2. **Keywords**: Add more keywords to cost code definitions
-3. **User Feedback**: Track manual overrides to improve
-4. **Few-shot Examples**: Could add to prompt if needed
+3. **User Feedback**: Track manual overrides to improve prompts
+4. **Few-shot Examples**: Can add to prompt if needed
 
 ### Sample Input → Output
 
@@ -619,10 +582,8 @@ Expected accuracy by category:
 
 | Task | Estimate |
 |------|----------|
-| Core classifier | 2 hours |
-| Response parsing | 1.5 hours |
-| Fallback logic | 1 hour |
-| Prompts | 45 min |
-| Utilities | 30 min |
+| BAML functions | 1 hour |
+| Classifier service | 1.5 hours |
+| Quality utilities | 30 min |
 | Testing | 1.5 hours |
-| **Total** | **~7.25 hours** |
+| **Total** | **~4.5 hours** |
